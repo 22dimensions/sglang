@@ -207,7 +207,6 @@ class GPTQConfig(QuantizationConfig):
         from sglang.srt.layers.linear import LinearBase
         if _is_npu:
             if isinstance(layer, LinearBase):
-                print("-----------this way sir please ------------")
                 return GPTQLinearAscendMethod(self)
 
         if isinstance(layer, FusedMoE):
