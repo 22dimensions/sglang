@@ -208,6 +208,7 @@ class GPTQConfig(QuantizationConfig):
         if _is_npu:
             if isinstance(layer, LinearBase):
                 return GPTQLinearAscendMethod(self)
+            return None
 
         if isinstance(layer, FusedMoE):
             raise TypeError("GPTQ Method does not support MoE, please use gptq_marlin")
@@ -828,6 +829,54 @@ class GPTQMarlinLinearMethod(LinearMethodBase):
             bias=bias,
         )
 
+def unpack_from_int32(
+    weight: torch.Tensor,
+    shape: torch.Size,
+    num_bits: int,
+    dtype: torch.dtype = torch.int8,
+    packed_dim: int = 1,
+) -> torch.Tensor:
+    """
+    Unpacks quantized weights from int32 format back to original bits.
+
+    :param weight: The packed int32 tensor containing quantized weights
+    :param shape: Original shape to restore, defaults to None
+    :param num_bits: The number of bits used for quantization (<= 8)
+    :param packed_dim: Dimension along which weights are packed (0 or 1), defaults to 1
+    :return: Unpacked tensor with int8 dtype after applying offset correction
+    """
+    assert weight.dtype == torch.int32, f"Expecting `weight.dtype` is torch.int32 but got {weight.dtype}."
+    assert num_bits <= 8, f"Expecting `num_bits` should not be larger than 8 but got {num_bits}."
+
+    pack_factor = 32 // num_bits
+    mask = (1 << num_bits) - 1
+
+    if packed_dim == 1:
+        unpacked_weight = torch.zeros(
+            (weight.shape[0], weight.shape[1] * pack_factor),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        for i in range(pack_factor):
+            unpacked_weight[:, i::pack_factor] = (weight >>
+                                                  (num_bits * i)) & mask
+        # original_row_size = int(shape[1])
+        # unpacked_weight = unpacked_weight[:, :original_row_size]
+    else:
+        unpacked_weight = torch.zeros(
+            (weight.shape[0] * pack_factor, weight.shape[1]),
+            device=weight.device,
+            dtype=torch.int32,
+        )
+        for i in range(pack_factor):
+            unpacked_weight[i::pack_factor, :] = (weight >>
+                                                  (num_bits * i)) & mask
+        # original_row_size = int(shape[0])
+        # unpacked_weight = unpacked_weight[:original_row_size, :]
+    offset = pow(2, num_bits) // 2 
+    unpacked_weight = (unpacked_weight - offset).to(dtype)
+    return unpacked_weight
+
 class GPTQLinearAscendMethod(GPTQLinearMethod):
     """Linear method for GPTQ on Ascend.
 
@@ -836,27 +885,40 @@ class GPTQLinearAscendMethod(GPTQLinearMethod):
     """
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
-        layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
-        qweight_tmp = torch.zeros_like(layer.qweight.data)
-        qzeros_tmp = layer.qzeros.data
-        qzeros_list = []
-        shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        print("-------------- layer qweight: ", layer.qweight.dtype, layer.qweight.shape, flush=True)
+        print("-------------- layer scales: ", layer.scales.dtype, layer.scales.shape, flush=True)
+        print("-------------- layer qzeros: ", layer.qzeros.dtype, layer.qzeros.shape, flush=True)
+        # if self.quant_config.weight_bits != 8:
+        #     raise ValueError(f"unsupported bit size {self.quant_config.weight_bits}")
 
-        for i in range(0, self.quant_config.pack_factor):
-            shift_num = shifts[i] * 4
-            qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
-            qweight_tmp.bitwise_or_(
-                ((layer.qweight.data >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
-            )
+        ## torch int32 -> int8
+        # layer.scales = torch.nn.Parameter(layer.scales.data, requires_grad=False)
+        # qweight_tmp = torch.zeros_like(layer.qweight.data)
+        # qzeros_tmp = layer.qzeros.data
+        # qzeros_list = []
+        # shifts = [0, 4, 1, 5, 2, 6, 3, 7]
+        # shifts = [0, 4, 2, 6]
 
-        qweight_tmp.bitwise_xor_(0x88888888)
+        # for i in range(0, 32 // self.quant_config.weight_bits):
+        #     shift_num = shifts[i] * 4
+        #     qzeros_list.append((qzeros_tmp.reshape(-1, 1) >> shift_num) & 0xF)
+        #     qweight_tmp.bitwise_or_(
+        #         ((layer.qweight.data >> shift_num) * (2 ** (4 * i))) & (0xF << (4 * i))
+        #     )
 
-        qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
-        qzeros_tmp = -(qzeros_tmp - 8)
-        qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
+        # qweight_tmp.bitwise_xor_(0x88888888)
 
-        layer.qzeros = torch.nn.Parameter(qzeros_tmp, requires_grad=False)
-        layer.qweight = torch.nn.Parameter(qweight_tmp, requires_grad=False)
+        # qzeros_tmp = torch.cat(qzeros_list, dim=-1).reshape(qzeros_tmp.shape[0], -1)
+        # qzeros_tmp = -(qzeros_tmp - 8)
+        # qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
+
+        layer.qzeros = torch.nn.Parameter(
+            unpack_from_int32(layer.qzeros.data.contiguous(), layer.qzeros.data.shape, 8, dtype=torch.float16, packed_dim=1), requires_grad=False)
+        layer.qweight = torch.nn.Parameter(
+            unpack_from_int32(layer.qweight.data.contiguous(),  layer.qweight.data.shape, 8, packed_dim=0), requires_grad=False)
+        print("after-------------- layer qweight: ", layer.qweight.dtype, layer.qweight.shape, flush=True)
+        print("after-------------- layer scales: ", layer.scales.dtype, layer.scales.shape, flush=True)
+        print("after-------------- layer qzeros: ", layer.qzeros.dtype, layer.qzeros.shape, flush=True)
 
     def apply(
         self,
@@ -865,27 +927,29 @@ class GPTQLinearAscendMethod(GPTQLinearMethod):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         qweight = layer.qweight
-        # scales = layer.scales
-        # qzeros = layer.qzeros
-        pack_factor = self.quant_config.pack_factor
-        out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
-        # reshaped_x = x.reshape(-1, x.shape[-1])
+        scales = layer.scales
+        qzeros = layer.qzeros
+        # print("------------qweight shape:", qweight.shape)
+        # print("------------ x.shape:", x.shape)
+        pack_factor = 32 // self.quant_config.weight_bits
+        # out_shape = x.shape[:-1] + (qweight.shape[-1] * pack_factor,)
+        reshaped_x = x.reshape(-1, x.shape[-1])
 
-        # if bias is not None and bias.dtype == torch.bfloat16:
-        #     bias = bias.float()
+        if bias is not None and bias.dtype == torch.bfloat16:
+            bias = bias.float()
 
-        # out = torch_npu.npu_weight_quant_batchmatmul(
-        #     reshaped_x,
-        #     qweight,
-        #     antiquant_scale=scales,
-        #     antiquant_offset=qzeros,
-        #     antiquant_group_size=self.quant_config.group_size,
-        #     bias=bias,
-        # )
+        # print("-------------- x shape", reshaped_x.shape, reshaped_x.dtype)
+        # print("-------------- q weight shape", qweight.shape, qweight.dtype)
+        out = torch_npu.npu_weight_quant_batchmatmul(
+            reshaped_x,
+            qweight,
+            antiquant_scale=scales,
+            antiquant_offset=qzeros,
+            antiquant_group_size=self.quant_config.group_size,
+            bias=bias,
+        )
 
-        print("-------------- in GPT Ascend")
-
-        return out_shape
+        return out
 
 class GPTQMarlinMoEMethod(FusedMoEMethodBase):
     """MoE Marlin method with quantization."""

@@ -306,15 +306,15 @@ class Qwen3DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            cache=(
-                [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
-                if _is_npu
-                else None
-            ),
+            # cache=(
+            #     [self.mlp.gate_up_proj.weight, self.mlp.down_proj.weight]
+            #     if _is_npu
+            #     else None
+            # ),
         )
         hidden_states = self.mlp(hidden_states)
-        if _is_npu and get_cmo_stream():
-            wait_cmo_stream()
+        # if _is_npu and get_cmo_stream():
+        #     wait_cmo_stream()
         hidden_states, residual = self.layer_communicator.postprocess_layer(
             hidden_states, residual, forward_batch
         )
@@ -550,7 +550,6 @@ class Qwen3ForCausalLM(nn.Module):
                 if name.endswith(".bias") and name not in params_dict:
                     continue
                 param = params_dict[name]
-                print("-----------", name, "-------", param.shape, param.weight_loader)
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
                 break
