@@ -888,6 +888,7 @@ class GPTQLinearAscendMethod(GPTQLinearMethod):
         print("-------------- layer qweight: ", layer.qweight.dtype, layer.qweight.shape, flush=True)
         print("-------------- layer scales: ", layer.scales.dtype, layer.scales.shape, flush=True)
         print("-------------- layer qzeros: ", layer.qzeros.dtype, layer.qzeros.shape, flush=True)
+        # print("0 ------------- 0", layer.qzeros.flatten()[100:120])
         # if self.quant_config.weight_bits != 8:
         #     raise ValueError(f"unsupported bit size {self.quant_config.weight_bits}")
 
@@ -913,9 +914,11 @@ class GPTQLinearAscendMethod(GPTQLinearMethod):
         # qzeros_tmp = qzeros_tmp.to(layer.scales.data.dtype)
 
         layer.qzeros = torch.nn.Parameter(
-            unpack_from_int32(layer.qzeros.data.contiguous(), layer.qzeros.data.shape, 8, dtype=torch.float16, packed_dim=1), requires_grad=False)
+            unpack_from_int32(layer.qzeros.data.contiguous(), layer.qzeros.data.shape, 8, dtype=torch.float16, packed_dim=1) + 1, requires_grad=False)
         layer.qweight = torch.nn.Parameter(
             unpack_from_int32(layer.qweight.data.contiguous(),  layer.qweight.data.shape, 8, packed_dim=0), requires_grad=False)
+        print("0 ------------- 0", layer.qzeros.flatten()[:10])
+        # print("0 ------------- 0", layer.qweight.flatten()[:10])
         print("after-------------- layer qweight: ", layer.qweight.dtype, layer.qweight.shape, flush=True)
         print("after-------------- layer scales: ", layer.scales.dtype, layer.scales.shape, flush=True)
         print("after-------------- layer qzeros: ", layer.qzeros.dtype, layer.qzeros.shape, flush=True)
