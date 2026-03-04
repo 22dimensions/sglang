@@ -1,684 +1,840 @@
-# RFC: SGLang SRT Hardware Plugin System
+# RFC: SGLang SRT Platform Abstraction System
 
 **Status**: Draft
 **Date**: 2026-03-04
-**Target**: SRT Core/Plugin Refactor
+**Inspired by**: [`sglang/multimodal_gen/runtime/platforms/`](python/sglang/multimodal_gen/runtime/platforms/)
 
 ---
 
 ## Abstract
 
-This RFC proposes a unified **hardware plugin mechanism** for SGLang's SRT runtime, enabling third-party hardware vendors to integrate their devices (GPUs, NPUs, IPUs, or any accelerator) into SGLang **without modifying upstream source code**. The system relies on standard Python entry points for plugin discovery and provides a coherent ABC that covers all hardware-specific extension points.
+This RFC proposes porting the **`Platform` abstraction pattern** already used in
+`sglang/multimodal_gen/runtime/platforms/` into the SRT core runtime
+(`python/sglang/srt/`).
+
+The result is a single `current_platform` singleton that encapsulates every
+hardware-specific decision, replacing the current scatter of `is_npu()` / `is_hip()`
+guards, hardcoded dictionaries, and giant if-elif factories across 10+ files.
+
+Third-party hardware vendors (Moore Threads, Enflame, Cambricon, …) point one
+environment variable at their class (`SGLANG_PLATFORM=my_pkg.MyPlatform`) and ship a
+single Python package. **No upstream files need to be modified.**
 
 ---
 
 ## Motivation
 
-### Current State
+### Current Pain Points
 
-SGLang already supports multiple hardware backends: CUDA GPUs, AMD ROCm GPUs, Intel XPUs, Huawei Ascend NPUs, Habana HPUs, and CPU-only inference. However, each integration required modifying **9+ upstream core files**. The Ascend NPU integration — the most comprehensive example — touched:
+SGLang's SRT runtime supports CUDA, ROCm, Intel XPU, Ascend NPU, Habana HPU, and
+CPU inference. However, **each integration required modifying 9+ upstream files**.
+The Ascend NPU example:
 
-| File | Reason for modification |
+| File | What had to change |
 |---|---|
-| `utils/common.py` | Add `is_npu()` hardware detection function |
-| `server_args.py` | Inject NPU-specific default arguments |
+| `utils/common.py` | Add `is_npu()` detection function |
+| `server_args.py` | Inject hardware-specific defaults |
 | `layers/attention/attention_registry.py` | Register attention backend |
-| `model_executor/model_runner.py` | Add device initialization branch |
-| `model_executor/model_runner_kv_cache_mixin.py` | Insert NPU branch into 400-line if-elif factory |
+| `model_executor/model_runner.py` | Add device init branch + graph runner entry |
+| `model_executor/model_runner_kv_cache_mixin.py` | Insert NPU branch in 200-line KV pool factory |
 | `layers/quantization/__init__.py` | Register quantization methods |
 | `layers/moe/utils.py` | Add MoE backend enum values |
-| `environ.py` | Add NPU-specific environment variables |
+| `environ.py` | Add NPU environment variables |
 | `distributed/parallel_state.py` | Register communication backend |
 
-The same pattern applies to every other hardware vendor wanting to integrate, including emerging players like Moore Threads (MUSA), Enflame, and future accelerators.
+The same cost applies to every future hardware vendor.
 
-### Core Problems
+### Root Cause
 
-1. **Code coupling** — Hardware-specific code is scattered across 15+ files with no clear boundaries
-2. **No plugin discovery** — All backends must be registered in-tree; out-of-tree development is impossible
-3. **Inconsistent extension points** — Attention backends have a decorator registry, but graph runners, memory pools, and communicators use hardcoded dicts or if-elif chains
-4. **Base class pollution** — `base_attn_backend.py` contains direct `is_npu()` calls; the base class must not know about specific hardware
-5. **Giant conditional factories** — `model_runner_kv_cache_mixin.py` has a 200-line if-elif chain for memory pool selection
+Hardware knowledge is **scattered**. Every subsystem re-implements its own switch:
+
+```python
+# model_runner.py  (~line 2027) — hardcoded dict
+device_to_graph_runner = {
+    "cuda": CudaGraphRunner, "npu": NPUGraphRunner, "cpu": CPUGraphRunner,
+}
+
+# utils/common.py — each added when a new device appeared
+def is_npu(): ...
+def is_hip(): ...
+def is_xpu(): ...
+
+# model_runner_kv_cache_mixin.py — 200 lines of hardware-specific if-elif
+if self.server_args.attention_backend == "ascend":
+    if self.use_mla_backend:
+        self.token_to_kv_pool = NPUMLATokenToKVPool(...)
+    ...
+elif ...:
+    ...
+```
+
+### The Fix Already Exists in This Repo
+
+`sglang/multimodal_gen/runtime/platforms/` solves exactly this problem: a `Platform`
+class + `current_platform` singleton. The pattern is:
+
+```python
+from sglang.srt.platforms import current_platform
+
+graph_runner_cls = current_platform.get_graph_runner_class()
+kv_pool          = current_platform.create_kv_pool(runner, ...)
+comm_cls         = current_platform.get_device_communicator_cls()
+current_platform.initialize_device(rank, local_rank)
+```
+
+**One object. One import. No scattered device guards.**
 
 ---
 
 ## Goals
 
-- **G1**: A hardware vendor ships a single Python package; `pip install` activates support in SGLang with no upstream changes required
-- **G2**: All hardware-related extension points (attention, memory pool, graph runner, communicator, quantization, MoE) share a consistent registration mechanism
-- **G3**: Existing in-tree backends (CUDA, ROCm, Ascend NPU, Intel XPU, Habana HPU, CPU) continue to work without any modification
-- **G4**: The plugin API is stable enough for vendors to maintain independent release cadences
+- **G1** — A hardware vendor ships one Python package and sets
+  `SGLANG_PLATFORM=my_pkg.MyPlatform`. No upstream file changes needed.
+- **G2** — All hardware decisions (attention, KV pool, graph runner, communicator,
+  quantization, MoE) live in the `Platform` class, not scattered across 10+ files.
+- **G3** — Built-in platforms (CUDA, ROCm, NPU, XPU, HPU, CPU) continue to work
+  unchanged; this is a pure extension, not a rewrite.
+- **G4** — The platform API is stable enough for vendors to maintain their own
+  release cadence independently of SGLang upstream.
 
 ## Non-Goals
 
-- Not refactoring Scheduler core scheduling logic
-- Not changing the model architecture registration mechanism (`SGLANG_EXTERNAL_MODEL_PACKAGE` remains unchanged)
-- Not introducing runtime plugin hot-reload (startup-time only)
-- Not changing the existing `AttentionBackend` method signatures
+- Not changing the Scheduler core logic.
+- Not changing the model registry (`SGLANG_EXTERNAL_MODEL_PACKAGE` stays).
+- Not supporting hot-reload of platforms at runtime (startup-time load only).
+- Not breaking existing `AttentionBackend` method signatures.
 
 ---
 
-## Background: Current Architecture
+## Background
 
-### What Works Today (Reusable)
+### The `multimodal_gen` Pattern
 
-- ✅ **Attention Backend Registry** (`attention_registry.py`) — decorator-based registration, good pattern to generalize
-- ✅ **External Model Package** (`SGLANG_EXTERNAL_MODEL_PACKAGE`) — external models already supported
-- ✅ `add_attention_backend_choices()` / `add_quantization_method_choices()` — exist but undocumented
-- ✅ `hardware_backend/npu/` — good directory layout as a template for vendor-owned code
+`multimodal_gen/runtime/platforms/` (adapted from vLLM) uses:
+
+1. **`Platform` base class** (`interface.py`) — all hardware methods live here.
+2. **Concrete subclasses** per device — `cuda.py`, `rocm.py`, `npu.py`, `musa.py`, …
+3. **Lazy `current_platform` singleton** (`__init__.py`) — resolved on first access
+   via `__getattr__`, supports out-of-tree override via `SGLANG_PLATFORM` env var.
+4. **`PlatformEnum.OOT`** — an explicit enum value for out-of-tree platforms.
+
+This RFC brings the identical structure to SRT's runtime, adding the SRT-specific
+extension points (`create_kv_pool`, `get_graph_runner_class`, etc.) that have no
+equivalent in the diffusion subsystem.
 
 ### Current Built-in Backend Landscape
 
-The plugin system must coexist with these built-in paths that will **not** be removed:
-
 | Device | Graph Runner | Attention Backends | Communicator |
 |---|---|---|---|
-| CUDA (NVIDIA) | `CudaGraphRunner` | flashinfer, fa3, fa4, cutlass_mla, trtllm_* | PyNCCL / custom all-reduce |
+| CUDA (NVIDIA) | `CudaGraphRunner` | flashinfer, fa3, fa4, cutlass_mla, trtllm_* | PyNCCL |
 | ROCm (AMD) | `CudaGraphRunner` | aiter, wave, flashinfer | PyNCCL |
 | NPU (Ascend) | `NPUGraphRunner` | ascend | NPUCommunicator |
 | XPU (Intel) | `CudaGraphRunner` | intel_xpu, intel_amx | XPUCommunicator |
 | HPU (Habana) | — | torch_native | HPUCommunicator |
 | CPU | `CPUGraphRunner` | torch_native, triton | — |
 
-### Pain Points to Fix
-
-- ❌ **Graph runner selection**: hardcoded dict in `model_runner.py:2027`
-- ❌ **Memory pool factory**: 200-line if-elif in `model_runner_kv_cache_mixin.py`
-- ❌ **Hardware detection**: hardcoded `is_npu()`, `is_hip()`, etc. in `utils/common.py`
-- ❌ **Device init**: hardcoded `if _is_npu: init_npu_backend()` in `model_runner.py:189`
-- ❌ **Server args defaults**: no hook for vendors to inject hardware-specific defaults
+All of these become implementations of `Platform` subclasses.
 
 ---
 
 ## Proposed Design
 
-### Overall Architecture
+### Directory Layout
 
 ```
-┌──────────────────────────────────────────────────────────────────┐
-│                        SGLang SRT Core                            │
-│                                                                    │
-│  ┌────────────────┐   ┌─────────────────┐   ┌────────────────┐  │
-│  │  PluginLoader  │   │  PluginRegistry  │   │  Core Runtime  │  │
-│  │                │──▶│                  │──▶│  model_runner  │  │
-│  │  entry_points  │   │  Active Plugin   │   │  scheduler     │  │
-│  │  SGLANG_PLUGINS│   │  + built-ins     │   │  attention...  │  │
-│  └────────────────┘   └─────────────────┘   └────────────────┘  │
-└──────────────────────────────────────────────────────────────────┘
-          ▲                      ▲
-          │                      │
-┌─────────┴──────┐   ┌───────────┴────────┐   ┌────────────────┐
-│  sglang-musa-  │   │  sglang-enflame-   │   │  sglang-xyz-   │
-│  plugin        │   │  plugin            │   │  plugin        │
-│  MusaPlugin()  │   │  EnflamePlugin()   │   │  XyzPlugin()   │
-└────────────────┘   └────────────────────┘   └────────────────┘
+python/sglang/srt/platforms/        ← mirrors multimodal_gen/runtime/platforms/
+├── __init__.py                     discovery logic + current_platform singleton
+├── interface.py                    Platform base class + PlatformEnum
+├── cuda.py                         NVIDIA CUDA
+├── rocm.py                         AMD ROCm
+├── npu.py                          Huawei Ascend NPU  (wraps existing hardware_backend/npu/)
+├── xpu.py                          Intel XPU
+├── hpu.py                          Habana HPU
+└── cpu.py                          CPU-only
 ```
 
-### Design Principle: Built-ins First, Plugin as Fallback
-
-The plugin system **never replaces** built-in paths; it extends them. The pattern used everywhere:
-
-```python
-# Pseudocode used for every extension point
-def select_X(device):
-    # 1. Built-in paths always run first (unchanged)
-    if device in _BUILTIN_X_MAP:
-        return _BUILTIN_X_MAP[device]
-
-    # 2. Plugin extension — triggered only for unknown devices
-    plugin = PluginRegistry.get_active_plugin()
-    if plugin and (result := plugin.get_X()):
-        return result
-
-    return _default_X  # existing fallback unchanged
-```
+Out-of-tree vendors ship their own package; no file is added to this directory.
 
 ---
 
-### Core Abstraction 1: `HardwarePlugin` Interface
-
-**New file**: `python/sglang/srt/plugin/hardware_plugin.py`
+### `interface.py` — `Platform` Base Class
 
 ```python
-from abc import ABC, abstractmethod
-from typing import Callable, Dict, List, Optional, Type
+# python/sglang/srt/platforms/interface.py
+from __future__ import annotations
+import enum
+from functools import lru_cache
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type
 
-class HardwarePlugin(ABC):
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+    from sglang.srt.model_executor.model_runner import ModelRunner
+
+
+class PlatformEnum(enum.Enum):
+    CUDA  = enum.auto()
+    ROCM  = enum.auto()
+    NPU   = enum.auto()
+    XPU   = enum.auto()
+    HPU   = enum.auto()
+    CPU   = enum.auto()
+    OOT   = enum.auto()   # Out-of-Tree; used by all third-party vendors
+
+
+class Platform:
     """
-    SGLang hardware plugin interface.
+    Single abstraction point for all hardware-specific behaviour in SRT.
 
-    Implement this class and publish it as a Python package with the
-    entry point group 'sglang.hardware_plugins' to integrate a new
-    hardware backend without modifying SGLang upstream.
+    Built-in platforms: add a subclass in sglang/srt/platforms/<device>.py
+    and a detection function in __init__.py.
 
-    Only device_name and is_available() are mandatory. Every other
-    method has a no-op default, so vendors only implement what they need.
+    Out-of-tree platforms: subclass Platform in your own package, set
+    _enum = PlatformEnum.OOT, and export the qualified name via
+    SGLANG_PLATFORM=<your.module.YourPlatform>.
     """
 
-    # ── Required ────────────────────────────────────────────────────
+    # ── Class-level identity ──────────────────────────────────────────────────
+    _enum: PlatformEnum
+    device_name: str      # e.g. "cuda", "npu", "musa"  — used in torch.device()
+    device_type: str      # torch device type string
+    dispatch_key: str = "CPU"   # PyTorch dispatch key
 
-    @property
-    @abstractmethod
-    def device_name(self) -> str:
-        """
-        Device name string used in torch.device and logging.
-        Examples: 'musa', 'npu', 'xpu', 'mlu', 'ncore'
-        Must not conflict with existing built-in device names.
-        """
-        ...
+    # ── Type predicates (lru_cache: evaluated once per process) ──────────────
+    @lru_cache(maxsize=1)
+    def is_cuda(self)        -> bool: return self._enum == PlatformEnum.CUDA
+    @lru_cache(maxsize=1)
+    def is_rocm(self)        -> bool: return self._enum == PlatformEnum.ROCM
+    @lru_cache(maxsize=1)
+    def is_npu(self)         -> bool: return self._enum == PlatformEnum.NPU
+    @lru_cache(maxsize=1)
+    def is_xpu(self)         -> bool: return self._enum == PlatformEnum.XPU
+    @lru_cache(maxsize=1)
+    def is_hpu(self)         -> bool: return self._enum == PlatformEnum.HPU
+    @lru_cache(maxsize=1)
+    def is_cpu(self)         -> bool: return self._enum == PlatformEnum.CPU
+    @lru_cache(maxsize=1)
+    def is_out_of_tree(self) -> bool: return self._enum == PlatformEnum.OOT
 
-    @abstractmethod
-    def is_available(self) -> bool:
-        """Return True if and only if this hardware is detected in the current environment."""
-        ...
+    @lru_cache(maxsize=1)
+    def is_cuda_alike(self) -> bool:
+        """True for CUDA and ROCm (both use the torch 'cuda' device namespace)."""
+        return self._enum in (PlatformEnum.CUDA, PlatformEnum.ROCM)
 
-    # ── Optional: Lifecycle ─────────────────────────────────────────
+    # ── Hardware introspection ────────────────────────────────────────────────
+    def get_device_name(self, device_id: int = 0) -> str:
+        raise NotImplementedError
 
+    def get_device_total_memory(self, device_id: int = 0) -> int:
+        """Total device memory in bytes."""
+        raise NotImplementedError
+
+    def get_device_capability(self, device_id: int = 0):
+        """(major, minor) compute capability tuple, or None."""
+        return None
+
+    def get_available_memory(self, device_id: int = 0) -> float:
+        """Available device memory in GiB."""
+        raise NotImplementedError
+
+    # ── Lifecycle hooks ───────────────────────────────────────────────────────
     def initialize_device(self, rank: int, local_rank: int) -> None:
         """
-        Device-level initialization (replaces hardcoded if _is_npu: init_npu_backend()).
         Called once per worker process before model loading.
+
+        Replaces scattered:
+            if _is_npu:  init_npu_backend()
+            elif _is_xpu: init_xpu_backend()
         """
         pass
 
     def apply_server_args_defaults(self, args: "ServerArgs") -> None:
         """
         Inject hardware-specific ServerArgs defaults.
-        Only applied when the user has not explicitly set the argument.
         Called at the end of ServerArgs.__post_init__().
+        Only override values the user left as None.
         """
         pass
 
-    # ── Optional: Kernel / Backend Extensions ───────────────────────
-
+    # ── Attention ─────────────────────────────────────────────────────────────
     def get_attention_backends(self) -> Dict[str, Callable]:
         """
-        Return {backend_name: factory_fn} for attention backends.
-        factory_fn signature: (runner: ModelRunner) -> AttentionBackend
+        Return {backend_name: factory_fn} for all attention backends this
+        platform provides.
+          factory_fn signature: (runner: ModelRunner) -> AttentionBackend
+
+        These are merged into attention_registry.ATTENTION_BACKENDS at startup.
+        Built-in names already in the registry are never overwritten.
         """
         return {}
 
     def get_default_attention_backend(self) -> Optional[str]:
-        """Return the preferred attention backend name for this hardware, or None."""
+        """
+        The preferred attention backend name when --attention-backend is not set.
+        Return None to keep SGLang's existing auto-selection logic.
+        """
         return None
 
+    # ── Execution graph ───────────────────────────────────────────────────────
     def get_graph_runner_class(self) -> Optional[Type]:
         """
-        Return a custom GraphRunner subclass (replaces the hardcoded device->class dict).
-        Return None to use the built-in selection logic.
+        The GraphRunner subclass for this platform.
+
+        Replaces the hardcoded dict:
+            {"cuda": CudaGraphRunner, "npu": NPUGraphRunner, ...}
+
+        Return None to fall back to the built-in dict (backward compat).
         """
         return None
 
-    def get_memory_pool_factory(self) -> Optional[Callable]:
+    # ── KV cache memory ───────────────────────────────────────────────────────
+    def create_kv_pool(self, runner: "ModelRunner", **kwargs):
         """
-        Return a factory: (runner, **kwargs) -> BaseTokenToKVPool.
-        Replaces the per-device branch in model_runner_kv_cache_mixin.py.
-        Return None to use built-in memory pool selection.
-        """
-        return None
+        Instantiate and return the KV cache memory pool.
 
-    def get_allocator_factory(self) -> Optional[Callable]:
-        """Return a factory for the KV cache allocator, or None for the built-in."""
-        return None
-
-    def get_communicator_class(self) -> Optional[Type]:
-        """
-        Return a custom GroupCoordinator subclass for collective communication.
-        Return None to use the built-in communicator (NCCL or device-specific).
+        Replaces the 200-line if-elif factory in model_runner_kv_cache_mixin.py.
+        Return None to fall back to the built-in selection logic (CUDA/CPU/Mamba/NSA).
         """
         return None
 
-    # ── Optional: Methods / Quantization ────────────────────────────
+    def get_allocator_class(self) -> Optional[Type]:
+        """Custom KV cache allocator class, or None for the built-in."""
+        return None
 
+    # ── Communication ─────────────────────────────────────────────────────────
+    def get_device_communicator_cls(self) -> Optional[str]:
+        """
+        Fully-qualified class name of the GroupCoordinator subclass for
+        collective communication (NCCL, HCCL, MCCL, …).
+        Return None to use the default NCCL path.
+        """
+        return None
+
+    # ── Quantization & MoE ────────────────────────────────────────────────────
     def get_quantization_methods(self) -> Dict[str, Type]:
-        """Return {method_name: QuantizationConfig subclass} for hardware quantization."""
+        """{method_name: QuantizationConfig subclass} — hardware-specific additions."""
         return {}
 
-    def get_moe_backends(self) -> Dict[str, str]:
-        """Return additional MoE A2A or runner backend names."""
+    def get_moe_a2a_backends(self) -> Dict[str, str]:
+        """Additional MoE all-to-all backend names."""
         return {}
 
     def get_disaggregation_backends(self) -> Dict[str, Type]:
-        """Return custom KV-transfer backends for prefill/decode disaggregation."""
+        """Custom KV-transfer backends for disaggregated prefill/decode."""
         return {}
-
-    # ── Optional: Configuration ──────────────────────────────────────
-
-    def get_environment_variables(self) -> List:
-        """
-        Declare hardware-specific environment variables (EnvField instances).
-        Used for documentation generation. Not required for the variables to work.
-        """
-        return []
 ```
 
 ---
 
-### Core Abstraction 2: `PluginRegistry`
+### `__init__.py` — Discovery & `current_platform` Singleton
 
-**New file**: `python/sglang/srt/plugin/plugin_registry.py`
+Identical structure to `multimodal_gen/runtime/platforms/__init__.py`:
+**lazy initialisation via `__getattr__`**, priority-ordered detection, and explicit
+override via `SGLANG_PLATFORM`.
 
 ```python
-import importlib, logging, os
-from typing import Dict, Optional
-from sglang.srt.plugin.hardware_plugin import HardwarePlugin
+# python/sglang/srt/platforms/__init__.py
+import logging, os, traceback
+from sglang.srt.platforms.interface import Platform, PlatformEnum  # noqa: F401
 
 logger = logging.getLogger(__name__)
 
-class PluginRegistry:
-    """
-    Central registry for SGLang hardware plugins.
 
-    Discovery order (highest priority first):
-      1. SGLANG_PLUGINS env var — for development / CI without installing a package
-      2. Python entry_points group 'sglang.hardware_plugins' — for production use
-      3. Manual register() calls — for testing
+# ── Built-in detection functions ─────────────────────────────────────────────
+# Each returns a fully-qualified Platform subclass name, or None.
 
-    Only one plugin is "active" at a time, selected as the first plugin
-    whose is_available() returns True.
-    """
+def _rocm_plugin() -> str | None:
+    try:
+        import amdsmi
+        amdsmi.amdsmi_init()
+        found = len(amdsmi.amdsmi_get_processor_handles()) > 0
+        amdsmi.amdsmi_shut_down()
+        if found:
+            return "sglang.srt.platforms.rocm.RocmPlatform"
+    except Exception:
+        pass
+    return None
 
-    _plugins: Dict[str, "HardwarePlugin"] = {}
-    _active_plugin: Optional["HardwarePlugin"] = None
-    _initialized: bool = False
+def _cuda_plugin() -> str | None:
+    try:
+        import pynvml
+        pynvml.nvmlInit()
+        found = pynvml.nvmlDeviceGetCount() > 0
+        pynvml.nvmlShutdown()
+        if found:
+            return "sglang.srt.platforms.cuda.CudaPlatform"
+    except Exception:
+        # Jetson fallback: CUDA without NVML
+        import os as _os
+        if _os.path.isfile("/etc/nv_tegra_release"):
+            return "sglang.srt.platforms.cuda.CudaPlatform"
+    return None
 
-    @classmethod
-    def discover_and_load(cls) -> None:
-        """Call once at process startup. Idempotent."""
-        if cls._initialized:
-            return
-        cls._initialized = True
-        cls._load_from_env()          # higher priority: env var
-        cls._load_from_entry_points() # standard packaging mechanism
-        cls._activate_for_current_device()
+def _npu_plugin() -> str | None:
+    try:
+        import torch
+        if torch.npu.is_available():
+            return "sglang.srt.platforms.npu.NpuPlatform"
+    except Exception:
+        pass
+    return None
 
-    @classmethod
-    def _load_from_entry_points(cls) -> None:
-        try:
-            from importlib.metadata import entry_points
-            for ep in entry_points(group="sglang.hardware_plugins"):
-                try:
-                    plugin: HardwarePlugin = ep.load()()
-                    cls._plugins.setdefault(plugin.device_name, plugin)
-                    logger.debug(f"[Plugin] Discovered: {plugin.device_name} from {ep.name}")
-                except Exception as e:
-                    logger.warning(f"[Plugin] Failed to load {ep.name}: {e}")
-        except Exception:
-            pass
+def _xpu_plugin() -> str | None:
+    try:
+        import torch
+        if torch.xpu.is_available():
+            return "sglang.srt.platforms.xpu.XpuPlatform"
+    except Exception:
+        pass
+    return None
 
-    @classmethod
-    def _load_from_env(cls) -> None:
-        """
-        SGLANG_PLUGINS=pkg.module.ClassName[,pkg2.module2.ClassName2]
-        Useful for development without packaging.
-        """
-        for spec in os.environ.get("SGLANG_PLUGINS", "").split(","):
-            spec = spec.strip()
-            if not spec:
-                continue
-            try:
-                module_path, class_name = spec.rsplit(".", 1)
-                plugin: HardwarePlugin = getattr(
-                    importlib.import_module(module_path), class_name
-                )()
-                cls._plugins[plugin.device_name] = plugin
-                logger.info(f"[Plugin] Loaded from SGLANG_PLUGINS: {plugin.device_name}")
-            except Exception as e:
-                logger.warning(f"[Plugin] Could not load '{spec}': {e}")
+def _hpu_plugin() -> str | None:
+    try:
+        import torch
+        if torch.hpu.is_available():
+            return "sglang.srt.platforms.hpu.HpuPlatform"
+    except Exception:
+        pass
+    return None
 
-    @classmethod
-    def _activate_for_current_device(cls) -> None:
-        for device_name, plugin in cls._plugins.items():
-            try:
-                if plugin.is_available():
-                    cls._active_plugin = plugin
-                    logger.info(f"[Plugin] Active: {device_name}")
-                    return
-            except Exception as e:
-                logger.debug(f"[Plugin] is_available() failed for {device_name}: {e}")
+def _cpu_plugin() -> str | None:
+    return "sglang.srt.platforms.cpu.CpuPlatform"   # always succeeds
 
-    @classmethod
-    def get_active_plugin(cls) -> Optional["HardwarePlugin"]:
-        return cls._active_plugin
 
-    @classmethod
-    def register(cls, plugin: "HardwarePlugin") -> None:
-        """Programmatic registration; intended for unit tests."""
-        cls._plugins[plugin.device_name] = plugin
-        if plugin.is_available():
-            cls._active_plugin = plugin
+# Detection order: first match wins.
+# ROCm must precede CUDA — ROCm machines expose CUDA-compatible devices.
+_BUILTIN_PLUGINS = [
+    _rocm_plugin,
+    _cuda_plugin,
+    _npu_plugin,
+    _xpu_plugin,
+    _hpu_plugin,
+    _cpu_plugin,    # final fallback
+]
+
+
+def _resolve_platform_cls_qualname() -> str:
+    # 1. Explicit override (OOT vendors use this exclusively)
+    if qualname := os.environ.get("SGLANG_PLATFORM", "").strip():
+        logger.info(f"[Platform] Using SGLANG_PLATFORM={qualname}")
+        return qualname
+
+    # 2. Auto-detection
+    for plugin in _BUILTIN_PLUGINS:
+        if qualname := plugin():
+            return qualname
+
+    raise RuntimeError(
+        "No SRT platform detected. "
+        "Set SGLANG_PLATFORM=<fully.qualified.ClassName> or install "
+        "the appropriate hardware support package."
+    )
+
+
+# ── Lazy singleton (same pattern as multimodal_gen) ──────────────────────────
+_current_platform: Platform | None = None
+_init_trace: str = ""
+current_platform: Platform          # declared for type checkers; resolved below
+
+
+def __getattr__(name: str):
+    if name == "current_platform":
+        # Lazy init: out-of-tree platforms must be able to do
+        #   `from sglang.srt.platforms import Platform`
+        # *before* current_platform is resolved, so we cannot resolve it at
+        # import time.
+        global _current_platform
+        if _current_platform is None:
+            from sglang.srt.utils.common import resolve_obj_by_qualname
+            qualname = _resolve_platform_cls_qualname()
+            _current_platform = resolve_obj_by_qualname(qualname)()
+            global _init_trace
+            _init_trace = "".join(traceback.format_stack())
+            logger.info(f"[Platform] Activated: {_current_platform.device_name}")
+        return _current_platform
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+__all__ = ["Platform", "PlatformEnum", "current_platform", "_init_trace"]
 ```
 
 ---
 
-### Integration Points
+### Built-in Platform Implementations (sketches)
 
-#### Point 1: Plugin Discovery (startup)
-
-**File**: `python/sglang/srt/model_executor/model_runner.py`
+**`cuda.py`** — NVIDIA GPU
 
 ```python
-# Add near the top of the file, after existing hardware detection flags
-from sglang.srt.plugin import PluginRegistry
-PluginRegistry.discover_and_load()  # no-op if no plugins installed
+# python/sglang/srt/platforms/cuda.py
+from sglang.srt.platforms.interface import Platform, PlatformEnum
 
-# In ModelRunner.__init__, AFTER the existing if _is_npu: block (~line 193)
-# (the existing block is untouched)
-else:
-    plugin = PluginRegistry.get_active_plugin()
-    if plugin:
-        plugin.initialize_device(rank=self.tp_rank, local_rank=self.gpu_id)
+class CudaPlatform(Platform):
+    _enum        = PlatformEnum.CUDA
+    device_name  = "cuda"
+    device_type  = "cuda"
+    dispatch_key = "CUDA"
+
+    def get_device_name(self, device_id=0):
+        import torch; return torch.cuda.get_device_name(device_id)
+
+    def get_device_total_memory(self, device_id=0):
+        import torch; return torch.cuda.get_device_properties(device_id).total_memory
+
+    def get_device_capability(self, device_id=0):
+        import torch; return torch.cuda.get_device_capability(device_id)
+
+    def get_available_memory(self, device_id=0):
+        import torch
+        free, _ = torch.cuda.mem_get_info(device_id)
+        return free / (1 << 30)
+
+    def get_attention_backends(self):
+        from sglang.srt.layers.attention.flashinfer_backend import FlashInferAttnBackend
+        from sglang.srt.layers.attention.triton_attn_backend import TritonAttnBackend
+        # fa3, fa4, cutlass_mla, trtllm_*, torch_native, flex_attention …
+        return {
+            "flashinfer":   lambda r: FlashInferAttnBackend(r),
+            "triton":       lambda r: TritonAttnBackend(r),
+            # …
+        }
+
+    def get_default_attention_backend(self):
+        return "flashinfer"
+
+    def get_graph_runner_class(self):
+        from sglang.srt.model_executor.cuda_graph_runner import CudaGraphRunner
+        return CudaGraphRunner
+
+    def get_device_communicator_cls(self):
+        return "sglang.srt.distributed.device_communicators.pynccl.PyNcclCommunicator"
 ```
 
-#### Point 2: Attention Backend Auto-registration
-
-**File**: `python/sglang/srt/layers/attention/attention_registry.py`
+**`npu.py`** — Huawei Ascend (wraps existing `hardware_backend/npu/`, zero NPU code deleted)
 
 ```python
-# At module initialization, after all built-in @register_attention_backend decorators
-def _register_plugin_attention_backends() -> None:
-    plugin = PluginRegistry.get_active_plugin()
-    if plugin:
-        for name, factory in plugin.get_attention_backends().items():
-            if name not in ATTENTION_BACKENDS:  # built-ins are never overridden
-                ATTENTION_BACKENDS[name] = factory
+# python/sglang/srt/platforms/npu.py
+from sglang.srt.platforms.interface import Platform, PlatformEnum
 
-_register_plugin_attention_backends()
+class NpuPlatform(Platform):
+    _enum        = PlatformEnum.NPU
+    device_name  = "npu"
+    device_type  = "npu"
+    dispatch_key = "NPU"
+
+    def initialize_device(self, rank, local_rank):
+        from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+        init_npu_backend()                              # existing logic, same call
+
+    def apply_server_args_defaults(self, args):
+        from sglang.srt.hardware_backend.npu.utils import set_default_server_args
+        set_default_server_args(args)                   # existing logic, same call
+
+    def get_attention_backends(self):
+        from sglang.srt.hardware_backend.npu.attention.ascend_backend import AscendAttnBackend
+        return {"ascend": lambda r: AscendAttnBackend(r)}
+
+    def get_default_attention_backend(self):
+        return "ascend"
+
+    def get_graph_runner_class(self):
+        from sglang.srt.hardware_backend.npu.graph_runner.npu_graph_runner import NPUGraphRunner
+        return NPUGraphRunner
+
+    def create_kv_pool(self, runner, **kwargs):
+        if runner.use_mla_backend:
+            from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMLATokenToKVPool
+            return NPUMLATokenToKVPool(runner, **kwargs)
+        from sglang.srt.hardware_backend.npu.memory_pool_npu import NPUMHATokenToKVPool
+        return NPUMHATokenToKVPool(runner, **kwargs)
+
+    def get_device_communicator_cls(self):
+        return "sglang.srt.distributed.device_communicators.npu_communicator.NpuCommunicator"
 ```
 
-#### Point 3: Graph Runner Selection
+---
 
-**File**: `python/sglang/srt/model_executor/model_runner.py` (~line 2027)
+### Out-of-Tree Platform (vendor ships this)
 
 ```python
-# BEFORE (unchanged):
-_BUILTIN_GRAPH_RUNNERS = {
-    "cuda": CudaGraphRunner,
-    "musa": CudaGraphRunner,   # existing entry stays
-    "cpu":  CPUGraphRunner,
-    "npu":  NPUGraphRunner,
-    # ...
+# sglang_musa_plugin/platform.py   — published as sglang-musa-plugin on PyPI
+
+from sglang.srt.platforms import Platform, PlatformEnum
+
+class MusaPlatform(Platform):
+    _enum        = PlatformEnum.OOT   # OOT for all third-party vendors
+    device_name  = "musa"
+    device_type  = "musa"
+    dispatch_key = "MUSA"
+
+    def initialize_device(self, rank, local_rank):
+        import torch_musa
+        torch_musa.set_device(local_rank)
+
+    def apply_server_args_defaults(self, args):
+        if args.attention_backend is None:
+            args.attention_backend = "musa_flash"
+        args.disable_custom_all_reduce = True
+
+    def get_attention_backends(self):
+        from sglang_musa_plugin.attention import MusaFlashAttnBackend
+        return {"musa_flash": lambda r: MusaFlashAttnBackend(r)}
+
+    def get_default_attention_backend(self):
+        return "musa_flash"
+
+    def get_graph_runner_class(self):
+        from sglang_musa_plugin.graph_runner import MusaGraphRunner
+        return MusaGraphRunner
+
+    def create_kv_pool(self, runner, **kwargs):
+        from sglang_musa_plugin.memory_pool import MusaMHAPool
+        return MusaMHAPool(runner, **kwargs)
+
+    def get_device_communicator_cls(self):
+        return "sglang_musa_plugin.communicator.MCCLCommunicator"
+```
+
+**Activation — one env var, no upstream changes:**
+
+```bash
+SGLANG_PLATFORM="sglang_musa_plugin.platform.MusaPlatform" \
+    python -m sglang.launch_server --model meta-llama/Llama-3.1-8B-Instruct
+```
+
+---
+
+### How SRT Core Files Change
+
+All hardware-specific guards in SRT core collapse to `current_platform` calls.
+
+#### `model_executor/model_runner.py`
+
+```python
+# ── BEFORE (line ~189) ─────────────────────────────────────────────────────
+if _is_npu:
+    from sglang.srt.hardware_backend.npu.utils import init_npu_backend
+    init_npu_backend()
+
+# ── AFTER — one line, works for every platform ────────────────────────────
+current_platform.initialize_device(rank=self.tp_rank, local_rank=self.gpu_id)
+```
+
+```python
+# ── BEFORE (line ~2027) ───────────────────────────────────────────────────
+device_to_graph_runner = {
+    "cuda": CudaGraphRunner, "musa": CudaGraphRunner,
+    "cpu":  CPUGraphRunner,  "npu":  NPUGraphRunner,
 }
-graph_runner_cls = _BUILTIN_GRAPH_RUNNERS.get(self.device)
+graph_runner_cls = device_to_graph_runner.get(self.device, CudaGraphRunner)
 
-# AFTER (append only):
-if graph_runner_cls is None:
-    plugin = PluginRegistry.get_active_plugin()
-    if plugin:
-        graph_runner_cls = plugin.get_graph_runner_class()
-if graph_runner_cls is None:
-    graph_runner_cls = CudaGraphRunner  # existing fallback
+# ── AFTER ─────────────────────────────────────────────────────────────────
+graph_runner_cls = current_platform.get_graph_runner_class()
+# (CudaPlatform.get_graph_runner_class() returns CudaGraphRunner, etc.)
 ```
 
-#### Point 4: Memory Pool Factory
-
-**File**: `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py`
+#### `model_executor/model_runner_kv_cache_mixin.py`
 
 ```python
-# At the very end of the existing if-elif chain, replace the final else:
-else:
-    plugin = PluginRegistry.get_active_plugin()
-    if plugin and (factory := plugin.get_memory_pool_factory()):
-        self.token_to_kv_pool = factory(self, ...)
+# ── BEFORE — 200-line if-elif chain ───────────────────────────────────────
+if self.server_args.attention_backend == "ascend":
+    if self.use_mla_backend:
+        from ... import NPUMLATokenToKVPool
+        self.token_to_kv_pool = NPUMLATokenToKVPool(...)
     else:
-        self.token_to_kv_pool = MHATokenToKVPool(...)  # original fallback preserved
+        ...
+elif ...:   # 180 more lines
+    ...
+
+# ── AFTER — single dispatch, builtin chain kept for CUDA/CPU/Mamba/NSA ────
+pool = current_platform.create_kv_pool(self, ...)
+if pool is None:
+    pool = _builtin_kv_pool_factory(self, ...)   # existing CUDA/CPU/Mamba logic
+self.token_to_kv_pool = pool
 ```
 
-#### Point 5: Server Args Defaults
-
-**File**: `python/sglang/srt/server_args.py`
+#### `server_args.py`
 
 ```python
 def __post_init__(self):
-    # ... all existing logic untouched ...
+    # … all existing logic unchanged …
 
-    # Append at the end — plugin injects defaults only where user left values as None
-    plugin = PluginRegistry.get_active_plugin()
-    if plugin:
-        plugin.apply_server_args_defaults(self)
+    # Append at end — platform injects defaults only for None values
+    from sglang.srt.platforms import current_platform
+    current_platform.apply_server_args_defaults(self)
+```
+
+#### `layers/attention/attention_registry.py`
+
+```python
+# Append after all @register_attention_backend decorators
+def _register_platform_backends():
+    from sglang.srt.platforms import current_platform
+    for name, factory in current_platform.get_attention_backends().items():
+        if name not in ATTENTION_BACKENDS:   # built-ins are never overwritten
+            ATTENTION_BACKENDS[name] = factory
+
+_register_platform_backends()
 ```
 
 ---
 
-### Packaging Convention for Vendor Plugins
+## Comparison with `multimodal_gen/runtime/platforms/`
 
-Any hardware vendor publishes a package following this layout:
+| Aspect | `multimodal_gen` | SRT (this RFC) |
+|---|---|---|
+| Base class | `Platform` | `Platform` (same) |
+| Singleton | `current_platform` | `current_platform` (same) |
+| Lazy init | `__getattr__` | `__getattr__` (same) |
+| OOT override env var | planned TODO | `SGLANG_PLATFORM=<qualname>` |
+| `PlatformEnum.OOT` | ✅ | ✅ included |
+| Attention | `get_attn_backend_cls_str()` returns one class qualname | `get_attention_backends()` returns a dict — needed because SRT users select by name via `--attention-backend` |
+| KV pool | N/A | `create_kv_pool()` |
+| Graph runner | N/A | `get_graph_runner_class()` |
+| Server args defaults | N/A | `apply_server_args_defaults()` |
+| Device init | N/A | `initialize_device()` |
 
-```
-sglang_<vendor>_plugin/
-├── __init__.py
-├── plugin.py             # VendorPlugin(HardwarePlugin) — main entry
-├── attention/
-│   └── vendor_attn.py    # AttentionBackend subclass
-├── memory/
-│   ├── vendor_pool.py    # BaseTokenToKVPool subclass
-│   └── vendor_alloc.py
-├── graph_runner/
-│   └── vendor_runner.py
-├── distributed/
-│   └── vendor_comm.py    # GroupCoordinator subclass
-└── quantization/
-    └── vendor_quant.py   # QuantizationConfig subclass
-
-# pyproject.toml of the vendor package:
-[project.entry-points."sglang.hardware_plugins"]
-<vendor-device> = "sglang_<vendor>_plugin.plugin:VendorPlugin"
-```
-
-**VendorPlugin skeleton**:
-
-```python
-# sglang_<vendor>_plugin/plugin.py
-from sglang.srt.plugin import HardwarePlugin
-
-class VendorPlugin(HardwarePlugin):
-
-    @property
-    def device_name(self) -> str:
-        return "<device>"   # e.g. "musa", "mlu", "ncore"
-
-    def is_available(self) -> bool:
-        try:
-            import vendor_torch_extension
-            return vendor_torch_extension.is_available()
-        except ImportError:
-            return False
-
-    def initialize_device(self, rank: int, local_rank: int) -> None:
-        import vendor_torch_extension
-        vendor_torch_extension.set_device(local_rank)
-
-    def apply_server_args_defaults(self, args) -> None:
-        if args.attention_backend is None:
-            args.attention_backend = "<vendor>_flash"
-        # Only set what the user hasn't already configured
-
-    def get_attention_backends(self):
-        from sglang_<vendor>_plugin.attention.vendor_attn import VendorFlashAttn
-        return {
-            "<vendor>_flash": lambda runner: VendorFlashAttn(runner),
-        }
-
-    def get_graph_runner_class(self):
-        from sglang_<vendor>_plugin.graph_runner.vendor_runner import VendorGraphRunner
-        return VendorGraphRunner
-
-    def get_communicator_class(self):
-        from sglang_<vendor>_plugin.distributed.vendor_comm import VendorCommunicator
-        return VendorCommunicator
-```
-
-**Activation** — two modes:
-
-```bash
-# Production: install the package; auto-activated on the target device
-pip install sglang-<vendor>-plugin
-
-# Development (no install needed):
-SGLANG_PLUGINS="sglang_vendor_plugin.plugin.VendorPlugin" \
-    python -m sglang.launch_server --model ...
-```
+The structural difference in attention handling is intentional: SRT users specify
+`--attention-backend flashinfer` by name, so the platform exposes a registry dict
+(`{name: factory}`) rather than a single resolved class.
 
 ---
 
 ## Implementation Plan
 
-### Phase 1 — Infrastructure (additive only, zero changes to existing code paths)
+### Phase 1 — New module, zero side-effects
 
-- Create `python/sglang/srt/plugin/` module
-  - `hardware_plugin.py` — HardwarePlugin ABC
-  - `plugin_registry.py` — PluginRegistry
-  - `__init__.py` — public exports
-- Add `PluginRegistry.discover_and_load()` call in `model_runner.py` (2 lines)
-- Declare `sglang.hardware_plugins` entry point group in `pyproject.toml` (3 lines)
-- Write unit tests with a `MockHardwarePlugin`
+Create `python/sglang/srt/platforms/` with `interface.py`, `__init__.py`, and all
+six built-in platform files. No existing file is modified. CI proves the module
+imports cleanly on all targets.
 
-**Files touched**:
-- `python/sglang/srt/plugin/` (new directory, 3 files)
-- `python/sglang/srt/model_executor/model_runner.py` (+2 lines)
-- `python/pyproject.toml` (+3 lines)
+**New files**:
+- [python/sglang/srt/platforms/\_\_init\_\_.py](python/sglang/srt/platforms/__init__.py)
+- [python/sglang/srt/platforms/interface.py](python/sglang/srt/platforms/interface.py)
+- [python/sglang/srt/platforms/cuda.py](python/sglang/srt/platforms/cuda.py)
+- [python/sglang/srt/platforms/rocm.py](python/sglang/srt/platforms/rocm.py)
+- [python/sglang/srt/platforms/npu.py](python/sglang/srt/platforms/npu.py)
+- [python/sglang/srt/platforms/xpu.py](python/sglang/srt/platforms/xpu.py)
+- [python/sglang/srt/platforms/hpu.py](python/sglang/srt/platforms/hpu.py)
+- [python/sglang/srt/platforms/cpu.py](python/sglang/srt/platforms/cpu.py)
 
-### Phase 2 — Extension Point Hooks (append-only pattern)
+### Phase 2 — Wire `current_platform` into SRT core
 
-- Attention backend auto-registration from plugin (`attention_registry.py`)
-- Graph runner plugin fallback in `model_runner.py`
-- Server args defaults hook in `server_args.py`
-- Device initialization hook in `model_runner.py`
-
-**Files touched**:
-- `python/sglang/srt/layers/attention/attention_registry.py` (+8 lines)
-- `python/sglang/srt/model_executor/model_runner.py` (+10 lines total)
-- `python/sglang/srt/server_args.py` (+5 lines)
-
-### Phase 3 — Memory Pool Plugin Fallback
-
-- Add plugin fallback at the end of the existing if-elif chain in `model_runner_kv_cache_mixin.py`
-- No existing branches are modified
-
-**Files touched**:
-- `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py` (+8 lines)
-
-### Phase 4 — Documentation & Template
-
-- Write *Hardware Backend Plugin Development Guide* (docs/)
-- Publish `sglang-plugin-template` skeleton repository
-- Add integration test with a mock plugin in CI
-
----
-
-## Critical File Paths
-
-### Files to Modify
+Replace the five hardware-switch sites with `current_platform` calls:
 
 | File | Change |
 |---|---|
-| `python/sglang/srt/model_executor/model_runner.py` | Add discover_and_load; device init and graph runner plugin fallback |
-| `python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py` | Memory pool plugin fallback in else branch |
-| `python/sglang/srt/server_args.py` | Plugin default injection at end of `__post_init__` |
-| `python/sglang/srt/layers/attention/attention_registry.py` | Plugin batch-register after built-ins |
-| `python/pyproject.toml` | Declare `sglang.hardware_plugins` entry point group |
+| [python/sglang/srt/model_executor/model_runner.py](python/sglang/srt/model_executor/model_runner.py) | Replace `if _is_npu: init_npu_backend()` → `current_platform.initialize_device(...)` |
+| [python/sglang/srt/model_executor/model_runner.py](python/sglang/srt/model_executor/model_runner.py) | Replace `device_to_graph_runner` dict → `current_platform.get_graph_runner_class()` |
+| [python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py](python/sglang/srt/model_executor/model_runner_kv_cache_mixin.py) | Dispatch to `current_platform.create_kv_pool(...)` before entering the existing if-elif chain |
+| [python/sglang/srt/server_args.py](python/sglang/srt/server_args.py) | Append `current_platform.apply_server_args_defaults(self)` at end of `__post_init__` |
+| [python/sglang/srt/layers/attention/attention_registry.py](python/sglang/srt/layers/attention/attention_registry.py) | Append `_register_platform_backends()` after built-in decorators |
 
-### New Files
+### Phase 3 — Replace scattered hardware detection calls
 
-| File | Content |
-|---|---|
-| `python/sglang/srt/plugin/__init__.py` | Public API exports |
-| `python/sglang/srt/plugin/hardware_plugin.py` | HardwarePlugin ABC |
-| `python/sglang/srt/plugin/plugin_registry.py` | PluginRegistry |
+`grep -r 'is_npu\|is_hip\|is_xpu\|_is_npu\|_is_hip' python/sglang/srt/` yields ~40
+call-sites. Replace each with `current_platform.is_npu()` etc. This is mechanical;
+existing `is_npu()` / `is_hip()` helpers in `utils/common.py` are kept as
+thin wrappers for backward compatibility.
 
-### Reference Files (patterns to reuse)
+### Phase 4 — Documentation
 
-| File | Pattern |
-|---|---|
-| `layers/attention/attention_registry.py` | Decorator registry → generalize to all extension points |
-| `hardware_backend/npu/utils.py` | `set_default_server_args()` → standardize as plugin hook |
-| `models/registry.py` | External package loading → align with entry_points |
+- Add `docs/developer_guide/hardware_platform_guide.md`
+- Provide `sglang-platform-template` skeleton repository
+- Add a `MockPlatform`-based integration test in CI
 
 ---
 
 ## Verification
 
-### Unit Tests
+### Unit tests
 
 ```python
-# tests/srt/test_plugin_system.py
+# tests/srt/test_platforms.py
+from sglang.srt.platforms import Platform, PlatformEnum
 
-class MockPlugin(HardwarePlugin):
-    @property
-    def device_name(self): return "mock_hw"
-    def is_available(self): return True
+class MockPlatform(Platform):
+    _enum       = PlatformEnum.OOT
+    device_name = "mock"
+    device_type = "cpu"
     def get_attention_backends(self):
-        return {"mock_attn": lambda runner: MockAttnBackend(runner)}
+        return {"mock_attn": lambda r: object()}
     def get_graph_runner_class(self):
-        return MockGraphRunner
+        return object   # sentinel
     def apply_server_args_defaults(self, args):
-        args.attention_backend = args.attention_backend or "mock_attn"
+        if args.attention_backend is None:
+            args.attention_backend = "mock_attn"
 
-def test_plugin_registration():
-    PluginRegistry.register(MockPlugin())
-    assert PluginRegistry.get_active_plugin().device_name == "mock_hw"
+def test_current_platform_overridable(monkeypatch):
+    import sglang.srt.platforms as p
+    monkeypatch.setattr(p, "_current_platform", MockPlatform())
+    assert p.current_platform.device_name == "mock"
 
-def test_attention_backend_injected():
-    # After registration, attention registry should include mock_attn
-    from sglang.srt.layers.attention.attention_registry import ATTENTION_BACKENDS
-    assert "mock_attn" in ATTENTION_BACKENDS
+def test_attention_backends_injected(monkeypatch):
+    import sglang.srt.platforms as p
+    import sglang.srt.layers.attention.attention_registry as reg
+    monkeypatch.setattr(p, "_current_platform", MockPlatform())
+    reg._register_platform_backends()
+    assert "mock_attn" in reg.ATTENTION_BACKENDS
 
-def test_builtin_not_overridden():
-    # Built-in 'triton' must survive plugin injection
-    assert "triton" in ATTENTION_BACKENDS
-
-def test_server_args_defaults():
-    from sglang.srt.server_args import ServerArgs
-    args = ServerArgs(model_path="dummy")
-    assert args.attention_backend == "mock_attn"
+def test_builtin_attention_not_overridden():
+    import sglang.srt.layers.attention.attention_registry as reg
+    assert "triton" in reg.ATTENTION_BACKENDS   # built-in must survive
 ```
 
-### Integration Test (env-var path)
+### Integration smoke test
 
 ```bash
-SGLANG_PLUGINS="tests.mock_hw_plugin.MockPlugin" \
-    python -m pytest tests/srt/test_plugin_integration.py -v
+SGLANG_PLATFORM="tests.srt.mock_platform.MockPlatform" \
+    python -c "from sglang.srt.platforms import current_platform; \
+               print(current_platform.device_name)"
+# expected: mock
 ```
 
-### Regression: Built-in Backends Unaffected
+### Regression: all built-in platforms unaffected
 
 ```bash
-# CUDA path unchanged
-python -m pytest tests/srt/ -k "cuda" -v
-
-# ROCm path unchanged (on ROCm CI)
-python -m pytest tests/srt/ -k "hip or rocm" -v
-
-# NPU path unchanged (on Ascend CI)
-python -m pytest tests/srt/ -k "npu or ascend" -v
+python -m pytest tests/srt/ -k "cuda"           -v   # NVIDIA CI
+python -m pytest tests/srt/ -k "hip or rocm"    -v   # AMD CI
+python -m pytest tests/srt/ -k "npu or ascend"  -v   # Ascend CI
 ```
 
 ---
 
 ## Open Questions
 
-1. **Q1 — Plugin priority**: If two installed plugins report `is_available() == True` (e.g., on a multi-device node), how should the active plugin be determined? Options: first-found, explicit `--plugin <name>` flag, or environment variable.
-2. **Q2 — Explicit activation**: Should `--plugin <device>` be added to `ServerArgs` to allow explicit selection independent of hardware auto-detection?
-3. **Q3 — Capability flags**: Should the plugin declare capability flags like `supports_mla: bool` or `supports_cuda_graph: bool` to let the scheduler make informed decisions without calling into vendor code?
-4. **Q4 — API stability guarantees**: What is the breaking-change policy for `HardwarePlugin`? Proposal: minor version bumps may add optional methods; major version bumps may change required methods.
-5. **Q5 — Communicator lifecycle**: The current communicator is initialized deep inside `distributed/` during process group setup. Does the plugin need an earlier hook for this?
+1. **Q1 — Priority when multiple platforms are available** — e.g., a node with both
+   ROCm and a PCIe NPU. Current answer: the detection list is ordered (ROCm before
+   CUDA before NPU…). `SGLANG_PLATFORM` always wins. Is this sufficient?
+
+2. **Q2 — Capability flags** — should `Platform` declare `supports_mla: bool`,
+   `supports_cuda_graph: bool` etc., so the Scheduler can make decisions without
+   calling into platform code (avoids circular imports)?
+
+3. **Q3 — Communicator lifecycle** — the communicator is initialised inside
+   `distributed/parallel_state.py` during `init_process_group`. Does `Platform` need
+   a hook *before* that call, or is `initialize_device()` early enough?
+
+4. **Q4 — API stability** — proposed contract: adding new optional methods to
+   `Platform` is a minor-version change; changing existing method signatures requires
+   a major-version bump and a deprecation cycle.
+
+5. **Q5 — Coexistence with `multimodal_gen/runtime/platforms/`** — should the two
+   `Platform` base classes eventually converge into a shared
+   `sglang.platforms.interface` module, or remain separate forever?
 
 ---
 
 ## Alternatives Considered
 
-### Option A — Document-only (rejected)
-Document the files that must be modified for each new backend, with no code changes.
-**Rejected**: Does not solve version tracking or out-of-tree development; vendors must still fork.
+### A — Separate `HardwarePlugin` + per-subsystem registries *(original draft)*
+Rejected: duplicates work already done in `multimodal_gen`; spreads hardware logic
+across multiple registries instead of one object.
 
-### Option B — Monkey-patching (rejected)
-Allow external packages to patch SGLang internals at runtime.
-**Rejected**: Fragile, hard to debug, zero interface stability guarantees.
+### B — Monkey-patching
+Rejected: fragile, no interface guarantees, impossible to document or version.
 
-### Option C — Fork-friendly consolidation (rejected)
-Consolidate all hardware logic into a single file to make forking easier.
-**Rejected**: Still requires a fork; does not enable pip-installable integration.
+### C — Document-only
+Rejected: does not enable out-of-tree development.
 
-### Option D — This proposal: standard Python entry_points
-Use `importlib.metadata` entry points (PEP 517/518 compliant).
-**Selected**: Aligns with Python ecosystem standards (same mechanism as pytest plugins, Flask extensions, etc.), version management is handled by pip, and `SGLANG_PLUGINS` env var covers development workflows.
+### D — This proposal: `Platform` pattern (mirrors `multimodal_gen`)
+Selected: consistent with existing SGLang codebase, proven pattern (adapted from
+vLLM), OOT vendor cost is one env var + one Python class.
